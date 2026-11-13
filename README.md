@@ -5,6 +5,7 @@
 ```text
 host-app/    上位机（Python + tkinter，Windows）
 model/       结构件模型（STL）
+BOM/         物料清单（采购参考，型号 / 规格 / 数量，不含价格）
 ```
 
 ## 上位机
@@ -23,6 +24,10 @@ python host-app/servo_control.py
 ## 模型
 
 `model/3D打印.stl` — 结构件打印模型，二进制 STL，可直接导入切片软件打印。
+
+## 物料清单
+
+`BOM/物料清单.jpg` — 整机物料清单，标注型号、规格与数量，供采购参考；采购价格已隐去。
 
 ## 后续补充
 
