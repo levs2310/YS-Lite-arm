@@ -1,9 +1,10 @@
 # YS-Lite-arm
 
-远山 Lite 六轴机械臂开源资料。目前包含上位机控制程序，仿真与 STL 模型后续补充。
+远山 Lite 六轴机械臂开源资料：上位机控制程序与结构件 3D 打印模型。
 
 ```text
 host-app/    上位机（Python + tkinter，Windows）
+model/       结构件模型（STL）
 ```
 
 ## 上位机
@@ -19,7 +20,10 @@ python host-app/servo_control.py
 
 无第三方依赖，串口经 Win32 API 实现，Windows + Python 3 即可运行。
 
+## 模型
+
+`model/3D打印.stl` — 结构件打印模型，二进制 STL，可直接导入切片软件打印。
+
 ## 后续补充
 
 - 仿真
-- STL 模型

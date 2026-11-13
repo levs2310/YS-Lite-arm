@@ -1,0 +1,5 @@
+# 二进制模型文件，禁止换行符转换与文本 diff
+*.stl binary
+*.step binary
+*.stp binary
+*.3mf binary
