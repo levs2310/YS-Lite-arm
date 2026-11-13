@@ -8,6 +8,9 @@ __pycache__/
 venv/
 env/
 
+# 运行时生成（轨迹录制等）
+tracks/
+
 # 编辑器
 .idea/
 .vscode/
