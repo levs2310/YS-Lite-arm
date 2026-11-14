@@ -23,7 +23,10 @@ python host-app/servo_control.py
 
 ## 模型
 
-`model/3D打印.stl` — 结构件打印模型，二进制 STL，可直接导入切片软件打印。
+均为二进制 STL。
+
+- `model/3D打印.stl` — 结构件打印模型，可直接导入切片软件打印
+- `model/装配.stl` — 整机装配体，用于核对安装位置与干涉
 
 ## 物料清单
 
