@@ -25,3 +25,14 @@ Desktop.ini
 
 # 运行日志
 *.log
+
+# ---------- 网页仿真 ----------
+# 依赖与构建产物不入库：克隆后 npm install && npm run build 重建
+网页仿真/playground/node_modules/
+网页仿真/playground/dist/
+网页仿真/playground/.vite/
+网页仿真/playground/.build-tmp/
+# 上一版 playground 的存档，不参与构建
+网页仿真/playground/_legacy/
+# 与 model/装配.stl 完全相同的副本，避免仓库里存两份 3 MB
+网页仿真/playground/public/STL/assembly.STL

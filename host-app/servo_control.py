@@ -4,27 +4,32 @@
 
 连接方式：USB-TTL 单线半双工，默认 115200-8-N-1
 控制方式：输入角度(°) → 换算 PWM → 下发 #IDPxxxxTyyyy!
-功能：六轴状态监控、参数设置、急停释放力矩/恢复
+功能：六轴状态监控、参数设置、急停释放力矩/恢复、网页仿真联动（可选方向）
 
-无第三方依赖（串口用 Win32 API，via ctypes）。
-调试：python servo_arm_gui.py --shot 截图.png   生成界面截图
+无第三方依赖（串口用 Win32 API，via ctypes；网页仿真走标准库 socket + http.server）。
+调试：python servo_control.py --shot 截图.png   生成界面截图
 """
 
+import base64
 import collections
 import ctypes
 import ctypes.wintypes as wt
+import functools
+import hashlib
+import http.server
 import json
 import os
 import queue
 import re
+import socket
+import struct
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import ttk, messagebox
 from tkinter import scrolledtext, filedialog
-
-from sim_bridge import SimBridge
 
 # ============================================================
 # 基础配置
@@ -389,6 +394,309 @@ def pwm_to_angle(joint, pwm):
 
 
 # ============================================================
+# 网页仿真联动（WebSocket 桥 + 静态服务，全部用标准库）
+# ============================================================
+# 协议与 网页仿真/playground 对齐：
+#   上位机 → 页面   {"type":"motor_angles","payload":{"angles":[6 个值]}}
+#   页面 → 上位机   {"type":"sim_angles","payload":{"angles":[6 个值],"t":秒}}
+# 前 5 个值是关节角(度)；第 6 个是夹爪开合量 0-400（0=闭合，400=全开）。
+
+SIM_WS_PORT = 8765
+SIM_HTTP_PORT = 8766
+SIM_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+SIM_GRIPPER_SPAN = 400.0
+# 仿真回写舵机时的死区（单位同协议）：小于该差值认为是自己推送的回声，忽略
+SIM_DEADBAND = (1.5, 1.5, 1.5, 1.5, 1.5, 3.0)
+
+SIM_MODE_TO_SIM = "真机 → 仿真"
+SIM_MODE_FROM_SIM = "仿真 → 真机"
+SIM_MODE_OFF = "关闭"
+SIM_MODES = [SIM_MODE_OFF, SIM_MODE_TO_SIM, SIM_MODE_FROM_SIM]
+# 下发给页面的机器可读模式名
+SIM_MODE_TOKENS = {
+    SIM_MODE_OFF: "off",
+    SIM_MODE_TO_SIM: "to_sim",
+    SIM_MODE_FROM_SIM: "from_sim",
+}
+
+# 仿真 → 真机的电流保护：电源电流有限，六轴同时启动会把电压拉低、总线跟着超时。
+# 所以一次只允许有限几路同时动，且按固定间隔依次下发。
+SIM_MAX_CONCURRENT = 2     # 同时运动的轴最多 2 路
+SIM_MOVE_GAP_MS = 80       # 两次下发的间隔
+SIM_MOVE_SPEED = 45.0      # 仿真下发用的速度(°/s)，比手动慢，峰值电流更低
+SIM_MOVE_MAX_MS = 700      # 单次动作时长上限
+
+
+def _ws_accept_key(key):
+    return base64.b64encode(hashlib.sha1((key + SIM_GUID).encode()).digest()).decode()
+
+
+def _ws_frame(text):
+    data = text.encode("utf-8")
+    n = len(data)
+    if n < 126:
+        head = struct.pack("!BB", 0x81, n)
+    elif n < 65536:
+        head = struct.pack("!BBH", 0x81, 126, n)
+    else:
+        head = struct.pack("!BBQ", 0x81, 127, n)
+    return head + data
+
+
+def _ws_recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _ws_recv_frame(sock):
+    """读一帧。浏览器发来的帧一定带掩码。返回 (opcode, payload) 或 None"""
+    head = _ws_recv_exact(sock, 2)
+    if not head:
+        return None
+    opcode = head[0] & 0x0F
+    masked = bool(head[1] & 0x80)
+    length = head[1] & 0x7F
+    if length == 126:
+        ext = _ws_recv_exact(sock, 2)
+        if ext is None:
+            return None
+        length = struct.unpack("!H", ext)[0]
+    elif length == 127:
+        ext = _ws_recv_exact(sock, 8)
+        if ext is None:
+            return None
+        length = struct.unpack("!Q", ext)[0]
+    if length > (1 << 20):          # 1 MB 上限，异常数据直接断开
+        return None
+    mask = _ws_recv_exact(sock, 4) if masked else b"\x00\x00\x00\x00"
+    if mask is None:
+        return None
+    payload = _ws_recv_exact(sock, length) if length else b""
+    if payload is None:
+        return None
+    if masked:
+        payload = bytes(payload[i] ^ mask[i % 4] for i in range(len(payload)))
+    return opcode, payload
+
+
+def sim_web_dir():
+    """网页仿真的构建产物目录（playground/dist）"""
+    base = app_dir()
+    candidates = [
+        os.path.join(base, "..", "网页仿真", "playground", "dist"),
+        os.path.join(base, "网页仿真", "playground", "dist"),
+        os.path.join(base, "..", "..", "网页仿真", "playground", "dist"),
+    ]
+    for p in candidates:
+        p = os.path.abspath(p)
+        if os.path.isdir(p):
+            return p
+    return os.path.abspath(candidates[0])
+
+
+class SimBridge:
+    """网页仿真桥：把关节角推给页面，同时接收页面拖动的角度"""
+
+    def __init__(self, host="127.0.0.1", port=SIM_WS_PORT, log=None, on_message=None):
+        self.host = host
+        self.port = port
+        self.log = log or (lambda msg: None)
+        self.on_message = on_message or (lambda msg: None)
+        self._clients = []
+        self._lock = threading.Lock()
+        self._alive = True
+        self._srv = None
+        self.started = False
+
+    # ---------------- 启停 ----------------
+    def start(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.host, self.port))
+            s.listen(8)
+            s.settimeout(1.0)
+            self._srv = s
+        except OSError as ex:
+            self.log("网页仿真桥启动失败（端口 %d 被占用？）：%s" % (self.port, ex))
+            return False
+        self._alive = True
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        self.started = True
+        self.log("网页仿真桥已启动：ws://127.0.0.1:%d" % self.port)
+        return True
+
+    def stop(self):
+        self._alive = False
+        try:
+            if self._srv:
+                self._srv.close()
+        except Exception:
+            pass
+        with self._lock:
+            for c in self._clients:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            self._clients.clear()
+        self.started = False
+
+    def client_count(self):
+        with self._lock:
+            return len(self._clients)
+
+    # ---------------- 连接 ----------------
+    def _accept_loop(self):
+        while self._alive:
+            try:
+                conn, _addr = self._srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            conn.settimeout(5)
+            req = b""
+            while b"\r\n\r\n" not in req:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    return
+                req += chunk
+                if len(req) > 16384:
+                    return
+            text = req.decode("latin-1")
+            if "upgrade: websocket" not in text.lower():
+                conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            key = ""
+            for line in text.split("\r\n")[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    if k.strip().lower() == "sec-websocket-key":
+                        key = v.strip()
+            if not key:
+                return
+            conn.sendall(("HTTP/1.1 101 Switching Protocols\r\n"
+                          "Upgrade: websocket\r\n"
+                          "Connection: Upgrade\r\n"
+                          "Sec-WebSocket-Accept: %s\r\n\r\n" % _ws_accept_key(key)).encode())
+            conn.settimeout(None)
+            with self._lock:
+                self._clients.append(conn)
+            self.log("网页仿真已连接（当前 %d 个页面）" % self.client_count())
+            while self._alive:
+                frame = _ws_recv_frame(conn)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == 0x8:            # close
+                    break
+                if opcode == 0x9:            # ping → pong
+                    try:
+                        conn.sendall(struct.pack("!BB", 0x8A, len(payload)) + payload)
+                    except OSError:
+                        break
+                    continue
+                if opcode != 0x1:            # 只要文本帧
+                    continue
+                try:
+                    msg = json.loads(payload.decode("utf-8"))
+                except Exception:
+                    continue
+                try:
+                    self.on_message(msg)
+                except Exception as ex:
+                    self.log("网页仿真消息处理失败：%s" % ex)
+        except Exception:
+            pass
+        finally:
+            with self._lock:
+                if conn in self._clients:
+                    self._clients.remove(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # ---------------- 推送 ----------------
+    def broadcast(self, obj):
+        """给所有已连接的页面发一条 JSON 消息"""
+        with self._lock:
+            if not self._clients:
+                return False
+            msg = _ws_frame(json.dumps(obj, ensure_ascii=False))
+            dead = []
+            for c in self._clients:
+                try:
+                    c.sendall(msg)
+                except OSError:
+                    dead.append(c)
+            for c in dead:
+                self._clients.remove(c)
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            return True
+
+    def push(self, angles):
+        self.broadcast({
+            "type": "motor_angles",
+            "payload": {"angles": [round(float(a), 2) for a in angles]},
+        })
+
+
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+
+class StaticServer:
+    """把网页仿真的构建产物用 HTTP 提供出去，点一下按钮就能打开"""
+
+    def __init__(self, directory, port=SIM_HTTP_PORT, log=None):
+        self.directory = directory
+        self.port = port
+        self.log = log or (lambda msg: None)
+        self._srv = None
+        self.started = False
+
+    def start(self):
+        if not os.path.isdir(self.directory):
+            self.log("网页仿真目录不存在：%s" % self.directory)
+            return False
+        handler = functools.partial(_QuietHandler, directory=self.directory)
+        try:
+            self._srv = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), handler)
+        except OSError as ex:
+            self.log("网页仿真静态服务启动失败（端口 %d）：%s" % (self.port, ex))
+            return False
+        threading.Thread(target=self._srv.serve_forever, daemon=True).start()
+        self.started = True
+        self.log("网页仿真已就绪：http://127.0.0.1:%d/" % self.port)
+        return True
+
+    def stop(self):
+        try:
+            if self._srv:
+                self._srv.shutdown()
+                self._srv.server_close()
+        except Exception:
+            pass
+        self._srv = None
+        self.started = False
+
+
+# ============================================================
 # 主界面
 # ============================================================
 class ArmApp:
@@ -464,8 +772,17 @@ class ArmApp:
                 "state": tk.StringVar(value="未知"),
             }
 
-        self.sim = SimBridge(log=self.log)
-        self.sim.start()
+        # 网页仿真联动（默认关闭，需要手动打开）
+        self.sim_mode = tk.StringVar(value=SIM_MODE_OFF)
+        self.sim = SimBridge(log=self.log, on_message=self._on_sim_message)
+        self._sim_ok = self.sim.start()
+        self._sim_http = None
+        self._sim_last_push = {}      # sid → 最近一次推给页面的值（用于回声抑制）
+        self._sim_pending = {}        # sid → 待下发的目标角度（合并最新值）
+        self._sim_active = {}         # sid → 该轴动作结束时刻（限制同时运动的路数）
+        self._sim_next_ok = 0.0
+        self._sim_tx_warn = 0.0
+        self._sim_mode_sent = None    # 已告知页面的 (模式, 页面数)，变了才重发
 
         self._build_ui()
         self._refresh_ports()
@@ -489,6 +806,7 @@ class ArmApp:
         self._build_top()
         self._build_table()
         self._build_toolbar()
+        self._build_sim_bar()
         self._build_log()
 
     def _build_top(self):
@@ -590,6 +908,24 @@ class ArmApp:
                   foreground="#0066CC").pack(side="left", padx=14)
         ttk.Button(traj, text="载入…", width=7,
                    command=self.load_track).pack(side="left", padx=6)
+
+    def _build_sim_bar(self):
+        box = ttk.LabelFrame(self.root, text="网页仿真")
+        box.pack(fill="x", padx=8, pady=(0, 4))
+
+        ttk.Button(box, text="打开网页仿真", width=13,
+                   command=self.open_sim).pack(side="left", padx=6, pady=4)
+        ttk.Label(box, text="联动").pack(side="left", padx=(10, 4))
+        cb = ttk.Combobox(box, textvariable=self.sim_mode, width=11, state="readonly",
+                          values=SIM_MODES)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._on_sim_mode())
+
+        self.sim_status = tk.StringVar(value="未连接")
+        ttk.Label(box, textvariable=self.sim_status,
+                  foreground="#0066CC").pack(side="left", padx=14)
+        ttk.Label(box, text="真机→仿真：把舵机角度推给页面　仿真→真机：拖动页面驱动舵机",
+                  foreground="#8A8A8A").pack(side="left", padx=(6, 4))
 
     def _build_log(self):
         box = ttk.LabelFrame(self.root, text="日志")
@@ -1135,7 +1471,15 @@ class ArmApp:
                 "已自动断开。请检查舵机电源，然后重新连接。")
 
         if getattr(self, "sim", None):
-            self.sim.push(self._sim_angles())
+            self._announce_sim_mode()
+            self._push_sim()
+            self._sim_step()
+            if getattr(self, "sim_status", None) is not None:
+                if self.sim_mode.get() == SIM_MODE_OFF:
+                    self.sim_status.set("已关闭（未联动）")
+                else:
+                    n = self.sim.client_count()
+                    self.sim_status.set(("已连接 %d 个页面" % n) if n else "等待页面连接")
 
         if self.estop:
             self.btn_estop.configure(text="急停中")
@@ -1423,6 +1767,143 @@ class ArmApp:
         out.append(0.0 if pwm6 is None else (pwm6 - 500) / 2000.0 * 400.0)
         return out
 
+    # ---------------- 网页仿真 ----------------
+    def _on_sim_mode(self):
+        mode = self.sim_mode.get()
+        if mode != SIM_MODE_FROM_SIM:
+            self._sim_pending.clear()       # 切走时丢弃还没下发的目标
+            self._sim_active.clear()
+        self.log("网页仿真联动：%s" % mode)
+        if mode == SIM_MODE_OFF:
+            self.sim_status.set("已关闭")
+        else:
+            self.sim_status.set("已连接 %d 个页面" % self.sim.client_count()
+                                if self.sim.client_count() else "等待页面连接")
+
+    def _announce_sim_mode(self):
+        """把当前联动模式告诉页面：页面据此禁用「当前末端逆解姿态」等会驱动真机的按钮"""
+        key = (self.sim_mode.get(), self.sim.client_count())
+        if key == self._sim_mode_sent:
+            return
+        mode = self.sim_mode.get()
+        self.sim.broadcast({
+            "type": "sim_mode",
+            "payload": {"mode": SIM_MODE_TOKENS.get(mode, "off"), "label": mode},
+        })
+        self._sim_mode_sent = key
+
+    def open_sim(self):
+        """起静态服务 + 打开浏览器"""
+        if not getattr(self, "_sim_ok", False):
+            self._sim_ok = self.sim.start()
+        web = sim_web_dir()
+        if not os.path.isdir(web):
+            messagebox.showinfo(
+                "网页仿真",
+                "没有找到网页仿真的构建产物：\n%s\n\n"
+                "请先在 网页仿真/playground 目录执行：\n    npm install && npm run build" % web)
+            return
+        if self._sim_http is None or not self._sim_http.started:
+            self._sim_http = StaticServer(web, SIM_HTTP_PORT, log=self.log)
+            if not self._sim_http.start():
+                return
+        url = "http://127.0.0.1:%d/" % SIM_HTTP_PORT
+        webbrowser.open(url)
+        self.log("已打开网页仿真：%s（联动模式：%s）" % (url, self.sim_mode.get()))
+
+    def _on_sim_message(self, msg):
+        """工作线程收到页面消息 → 切回 UI 线程处理"""
+        if not isinstance(msg, dict):
+            return
+        if msg.get("type") != "sim_angles":
+            return
+        payload = msg.get("payload") or {}
+        angles = payload.get("angles")
+        if isinstance(angles, list) and len(angles) >= 6:
+            try:
+                self.root.after(0, lambda: self._apply_sim_angles(angles))
+            except Exception:
+                pass
+
+    def _apply_sim_angles(self, angles):
+        """仿真 → 真机：这里只记录目标，真正下发交给 _sim_step 串行排队"""
+        if self.sim_mode.get() != SIM_MODE_FROM_SIM:
+            return
+        if self.estop:
+            return
+        if not self.connected:
+            if time.time() - self._sim_tx_warn > 5:
+                self._sim_tx_warn = time.time()
+                self.log("网页仿真在发角度，但串口未连接，已忽略", "err")
+            return
+
+        for idx, sid in enumerate(SERVO_IDS):
+            try:
+                val = float(angles[idx])
+            except (TypeError, ValueError, IndexError):
+                continue
+            last = self._sim_last_push.get(sid)
+            if last is not None and abs(val - last) < SIM_DEADBAND[idx]:
+                continue
+            j = self.joints[sid]
+            if sid == 6:
+                pwm = PWM_MIN_LIMIT + val / SIM_GRIPPER_SPAN * (PWM_MAX_LIMIT - PWM_MIN_LIMIT)
+                pwm = max(PWM_MIN_LIMIT, min(PWM_MAX_LIMIT, pwm))
+                ang = pwm_to_angle(j, pwm)
+            else:
+                ang = max(float(j.get("amin", -135)), min(float(j.get("amax", 135)), val))
+            self._sim_pending[sid] = ang      # 同轴只留最新值，避免积压
+
+    def _sim_step(self):
+        """把仿真目标串行下发：限制同时运动的轴数，避免六轴一起启动把电源拉低"""
+        if self.sim_mode.get() != SIM_MODE_FROM_SIM:
+            self._sim_pending.clear()
+            self._sim_active.clear()
+            return
+        if not (self.connected and self._sim_pending) or self.estop:
+            return
+
+        now = time.time()
+        for sid in [s for s, end in self._sim_active.items() if end <= now]:
+            self._sim_active.pop(sid, None)
+        if len(self._sim_active) >= SIM_MAX_CONCURRENT:
+            return
+        if now < self._sim_next_ok:
+            return
+
+        def gap_to(sid):
+            cur = self.state[sid]["angle"]
+            if cur is None:
+                return 999.0
+            return abs(self._sim_pending[sid] - cur)
+
+        sid = max(self._sim_pending, key=gap_to)
+        ang = self._sim_pending.pop(sid)
+        j = self.joints[sid]
+        pwm, ang2 = angle_to_pwm(j, ang)
+        cmd, applied = self._apply_comp(sid, pwm)
+        t = max(120, min(SIM_MOVE_MAX_MS, self._move_time(sid, cmd, SIM_MOVE_SPEED)))
+
+        self.row_vars[sid]["target"].set("%.1f" % ang2)
+        self._tx_frame(self._cmd_move(sid, cmd, t),
+                       "(仿真 → %s %.1f°  %dms)" % (j["name"], ang2, t))
+        # 动作期间跳过这一路的位置查询，但不动全局暂停，其他轴的状态仍能刷新
+        self._absent_until[sid] = now + t / 1000.0 + 0.1
+        self._fail_streak[sid] = 0
+        self._sim_active[sid] = now + t / 1000.0
+        self._sim_next_ok = now + SIM_MOVE_GAP_MS / 1000.0
+
+    def _push_sim(self):
+        """真机 → 仿真：按联动模式把当前角度推给页面"""
+        if self.sim_mode.get() != SIM_MODE_TO_SIM:
+            return
+        if not self.sim.client_count():
+            return
+        angles = self._sim_angles()
+        for i, sid in enumerate(SERVO_IDS):
+            self._sim_last_push[sid] = angles[i]
+        self.sim.push(angles)
+
     # ---------------- 工作线程 ----------------
     def _on_autohome_toggle(self):
         self.cfg["autohome"] = bool(self.autohome_var.get())
@@ -1639,6 +2120,11 @@ class ArmApp:
         try:
             if getattr(self, "sim", None):
                 self.sim.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_sim_http", None):
+                self._sim_http.stop()
         except Exception:
             pass
         try:

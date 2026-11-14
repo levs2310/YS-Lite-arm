@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>六轴机械臂 · URDF 视图</title>
+  <style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#11161c; color:#d7e0e8;
+      font-family:"Microsoft YaHei", system-ui, sans-serif; font-size:13px; }
+    #app { position:absolute; inset:0; }
+    #panel { position:absolute; top:0; left:0; bottom:0; width:310px; background:#171f27;
+      border-right:1px solid #26323d; padding:12px 14px 24px; overflow-y:auto; }
+    h1 { font-size:12px; margin:16px 0 8px; font-weight:600; color:#7d8b99; letter-spacing:1px; }
+    h1:first-child { margin-top:0; }
+    .joint { margin-bottom:10px; }
+    .joint .h { display:flex; justify-content:space-between; color:#7d8b99; margin-bottom:3px; }
+    .joint .h b { color:#d7e0e8; font-weight:500; }
+    .joint .h span { font-family:Consolas, monospace; color:#7ee081; }
+    input[type=range] { width:100%; accent-color:#3f9bff; }
+    button { background:#22303c; color:#d7e0e8; border:1px solid #26323d;
+      border-radius:4px; padding:7px 10px; cursor:pointer; font-family:inherit; }
+    button:hover { background:#2c3d4c; }
+    button.primary { background:#3f9bff; border-color:#3f9bff; color:#04121f; font-weight:600; }
+    button.primary:hover { filter:brightness(1.08); }
+    button:disabled { opacity:.42; cursor:not-allowed; filter:none; }
+    #btnZero { width:100%; margin-top:6px; }
+    .ee-now { font-family:Consolas, monospace; color:#7ee081; margin-bottom:8px; }
+    .ee-row { display:flex; gap:8px; margin-bottom:8px; }
+    .ee-row label { flex:1; color:#7d8b99; font-size:12px; }
+    .ee-row input { width:100%; background:#0e141a; color:#d7e0e8; border:1px solid #26323d;
+      border-radius:4px; padding:5px 6px; font-family:Consolas, monospace; margin-top:2px; }
+    .btn-row { display:flex; gap:8px; }
+    .btn-row button { flex:1; }
+    #ikMsg { color:#7d8b99; margin-top:8px; line-height:1.6; font-size:12px; min-height:18px; }
+    .tip { color:#5f6f7e; margin-top:14px; line-height:1.7; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <aside id="panel">
+    <h1>六轴关节</h1>
+    <div id="joints"></div>
+    <button id="btnZero">全部归零</button>
+
+    <h1>末端坐标 (mm)</h1>
+    <div class="ee-now" id="eeNow">--</div>
+    <div class="btn-row">
+      <button class="primary" id="btnAltPose">当前末端逆解姿态</button>
+    </div>
+    <div id="ikMsg"></div>
+
+    <div class="tip" id="simStatus">上位机：未连接</div>
+
+    <div class="tip">
+      键盘：A/D 关节1　W/S 关节2　I/K 关节3<br/>
+      J/L 关节4　H/F 关节5　Z/X 关节6<br/><br/>
+      也可以直接拖橙色小球，松手后自动解一次逆解。
+    </div>
+  </aside>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

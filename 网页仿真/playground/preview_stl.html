@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>STL 装配预览（免构建）</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#11161c;color:#d7e0e8;
+    font-family:"Microsoft YaHei",system-ui,sans-serif;font-size:13px}
+  #app{position:absolute;inset:0}
+  #panel{position:absolute;top:0;right:0;bottom:0;width:300px;background:#171f27;
+    border-left:1px solid #26323d;padding:12px 14px;overflow-y:auto}
+  h1{font-size:14px;margin:0 0 10px}
+  .row{display:flex;gap:6px;align-items:center;margin-bottom:6px}
+  button{background:#22303c;color:#d7e0e8;border:1px solid #26323d;border-radius:4px;
+    padding:5px 10px;cursor:pointer}
+  button.primary{background:#3f9bff;border-color:#3f9bff;color:#04121f;font-weight:600}
+  .item{display:flex;gap:6px;align-items:center;margin:3px 0;color:#9fb0bf}
+  .sw{width:10px;height:10px;border-radius:2px;display:inline-block}
+  .hint{color:#7d8b99;line-height:1.6}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<aside id="panel">
+  <h1>STL 装配预览</h1>
+  <div class="row">
+    <button class="primary" id="btnLoad" style="flex:1">加载 public/STL/manifest.json</button>
+  </div>
+  <div class="row">
+    <button id="btnClear" style="flex:1">清空</button>
+    <button id="btnFit" style="flex:1">重新取景</button>
+  </div>
+  <div id="list"></div>
+  <div class="hint" id="info" style="margin-top:10px">—</div>
+</aside>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/",
+    "three/": "/node_modules/three/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three'
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { STLLoader } from 'three/addons/loaders/STLLoader.js'
+
+// ---------- 场景（Y 向上） ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true })
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
+renderer.setSize(innerWidth, innerHeight)
+renderer.shadowMap.enabled = true
+document.getElementById('app').appendChild(renderer.domElement)
+
+const scene = new THREE.Scene()
+scene.background = new THREE.Color(0x11161c)
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 20000)
+camera.position.set(300, 260, 380)
+camera.up.set(0, 1, 0)
+
+const controls = new OrbitControls(camera, renderer.domElement)
+controls.enableDamping = true
+
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x20262c, 1.1))
+const sun = new THREE.DirectionalLight(0xffffff, 1.6)
+sun.position.set(300, 500, 300)
+scene.add(sun)
+
+let grid = null
+let ground = null
+
+// ---------- 加载 ----------
+let group = null
+const parts = []
+
+function clearAll() {
+  if (group) {
+    scene.remove(group)
+    group.traverse(o => {
+      if (o.geometry) o.geometry.dispose()
+      if (o.material) o.material.dispose()
+    })
+  }
+  group = null
+  parts.length = 0
+  document.getElementById('list').innerHTML = ''
+  document.getElementById('info').textContent = '—'
+}
+
+function load() {
+  clearAll()
+  fetch('/public/STL/manifest.json?t=' + Date.now())
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json() })
+    .then(names => {
+      if (!Array.isArray(names) || !names.length) throw new Error('manifest 为空')
+      group = new THREE.Group()
+      scene.add(group)
+      const loader = new STLLoader()
+      let done = 0
+      names.forEach((raw, idx) => {
+        const entry = typeof raw === 'string' ? { file: raw } : raw
+        const name = entry.file
+        const off = entry.offset || [0, 0, 0]
+        loader.load('/public/STL/' + encodeURIComponent(name), geo => {
+          geo.computeVertexNormals()
+          const mat = new THREE.MeshStandardMaterial({
+            color: new THREE.Color().setHSL((idx * 0.13) % 1, 0.35, 0.62),
+            metalness: 0.2, roughness: 0.7,
+            side: (entry.flip ? THREE.DoubleSide : THREE.FrontSide)
+          })
+          const mesh = new THREE.Mesh(geo, mat)
+          mesh.position.set(off[0] || 0, off[1] || 0, off[2] || 0)
+          if (entry.flip) mesh.scale.y = -1
+          group.add(mesh)
+          parts.push({ name, mesh, idx })
+          if (++done === names.length) finish()
+        }, undefined, err => {
+          console.warn('load fail', name, err)
+          if (++done === names.length) finish()
+        })
+      })
+    })
+    .catch(e => {
+      document.getElementById('info').textContent = '加载失败：' + e.message
+      alert('加载失败：' + e.message)
+    })
+}
+
+function finish() {
+  // 列表
+  const list = document.getElementById('list')
+  list.innerHTML = ''
+  parts.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+  parts.forEach(p => {
+    const row = document.createElement('label')
+    row.className = 'item'
+    const cb = document.createElement('input')
+    cb.type = 'checkbox'; cb.checked = true
+    cb.addEventListener('change', () => { p.mesh.visible = cb.checked })
+    const sw = document.createElement('span')
+    sw.className = 'sw'
+    sw.style.background = '#' + p.mesh.material.color.getHexString()
+    row.appendChild(cb); row.appendChild(sw)
+    row.appendChild(document.createTextNode(p.name))
+    list.appendChild(row)
+  })
+
+  // 包围盒
+  const box = new THREE.Box3().setFromObject(group)
+  const size = box.getSize(new THREE.Vector3())
+  const center = box.getCenter(new THREE.Vector3())
+  document.getElementById('info').textContent =
+    `7 件  bbox ${size.x.toFixed(1)} × ${size.y.toFixed(1)} × ${size.z.toFixed(1)} mm\n` +
+    `中心 (${center.x.toFixed(1)}, ${center.y.toFixed(1)}, ${center.z.toFixed(1)})`
+
+  // 网格/地面按尺寸
+  const r = Math.max(size.x, size.y, size.z) * 0.5 || 1
+  if (grid) { scene.remove(grid); grid.geometry.dispose(); grid.material.dispose() }
+  grid = new THREE.GridHelper(r * 8, 30, 0x2b3a47, 0x1d2831)
+  grid.position.set(center.x, box.min.y, center.z)
+  scene.add(grid)
+
+  if (ground) { scene.remove(ground); ground.geometry.dispose() }
+  ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(r * 16, r * 16),
+    new THREE.ShadowMaterial({ opacity: 0.3 })
+  )
+  ground.rotation.x = -Math.PI / 2
+  ground.position.copy(grid.position)
+  scene.add(ground)
+
+  fit()
+}
+
+function fit() {
+  if (!group) return
+  const box = new THREE.Box3().setFromObject(group)
+  if (box.isEmpty()) return
+  const center = box.getCenter(new THREE.Vector3())
+  const size = box.getSize(new THREE.Vector3())
+  const r = Math.max(size.x, size.y, size.z) * 0.5 || 1
+  controls.target.copy(center)
+  const dist = r / Math.tan((camera.fov * Math.PI) / 360) * 1.8
+  camera.position.set(center.x + dist * 0.75, center.y + dist * 0.6, center.z + dist * 0.75)
+  camera.near = Math.max(r / 500, 0.01)
+  camera.far = dist * 30
+  camera.updateProjectionMatrix()
+  controls.update()
+}
+
+document.getElementById('btnLoad').addEventListener('click', load)
+document.getElementById('btnClear').addEventListener('click', clearAll)
+document.getElementById('btnFit').addEventListener('click', fit)
+
+function animate() {
+  requestAnimationFrame(animate)
+  controls.update()
+  renderer.render(scene, camera)
+}
+animate()
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight
+  camera.updateProjectionMatrix()
+  renderer.setSize(innerWidth, innerHeight)
+})
+
+// 自动加载一次
+load()
+</script>
+</body>
+</html>

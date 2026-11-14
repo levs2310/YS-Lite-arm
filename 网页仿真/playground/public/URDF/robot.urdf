@@ -1,0 +1,88 @@
+<?xml version="1.0"?>
+<robot name="my_arm">
+
+  <link name="link0_base">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/link0_base.STL"/></geometry>
+    </visual>
+  </link>
+  <link name="link1_yaw">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/link1_yaw.STL"/></geometry>
+    </visual>
+  </link>
+  <link name="link2_arm">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/link2_arm.STL"/></geometry>
+    </visual>
+  </link>
+  <link name="link3_fore">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/link3_fore.STL"/></geometry>
+    </visual>
+  </link>
+  <link name="link4_roll">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/link4_roll.STL"/></geometry>
+    </visual>
+  </link>
+  <link name="link5_wrist">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/link5_wrist.STL"/></geometry>
+    </visual>
+  </link>
+  <link name="link6_roll">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="meshes/link6_roll.STL"/></geometry>
+    </visual>
+  </link>
+  <joint name="joint1_yaw" type="revolute">
+    <parent link="link0_base"/>
+    <child link="link1_yaw"/>
+    <origin xyz="0.0000 52.8000 0.0000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint2_arm" type="revolute">
+    <parent link="link1_yaw"/>
+    <child link="link2_arm"/>
+    <origin xyz="20.0000 16.2000 26.6000" rpy="0 0 0"/>
+    <axis xyz="0 0 -1"/>
+    <limit lower="-0.0524" upper="2.6180" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint3_fore" type="revolute">
+    <parent link="link2_arm"/>
+    <child link="link3_fore"/>
+    <origin xyz="-90.0000 0.0000 0.0000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.0524" upper="2.6180" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint4_roll" type="revolute">
+    <parent link="link3_fore"/>
+    <child link="link4_roll"/>
+    <origin xyz="35.4000 41.6000 -26.6000" rpy="0 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint5_wrist" type="revolute">
+    <parent link="link4_roll"/>
+    <child link="link5_wrist"/>
+    <origin xyz="36.2000 0.0000 25.5000" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.0944" upper="2.0944" effort="10" velocity="3"/>
+  </joint>
+  <joint name="joint6_roll" type="revolute">
+    <parent link="link5_wrist"/>
+    <child link="link6_roll"/>
+    <origin xyz="73.2000 0.0000 -25.5000" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="10" velocity="3"/>
+  </joint>
+</robot>

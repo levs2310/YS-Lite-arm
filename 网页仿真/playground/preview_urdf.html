@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>URDF 预览（免构建）</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#11161c;color:#d7e0e8;
+    font-family:"Microsoft YaHei",system-ui,sans-serif;font-size:13px}
+  #app{position:absolute;inset:0}
+  #panel{position:absolute;top:0;right:0;bottom:0;width:330px;background:#171f27;
+    border-left:1px solid #26323d;padding:12px 14px;overflow-y:auto}
+  h1{font-size:14px;margin:0 0 10px}
+  h2{font-size:11px;color:#7d8b99;margin:14px 0 6px;letter-spacing:1px}
+  .row{display:flex;gap:6px;align-items:center;margin-bottom:6px}
+  button{background:#22303c;color:#d7e0e8;border:1px solid #26323d;border-radius:4px;
+    padding:5px 10px;cursor:pointer}
+  button.primary{background:#3f9bff;border-color:#3f9bff;color:#04121f;font-weight:600}
+  .joint{margin-bottom:8px}
+  .joint .h{display:flex;justify-content:space-between;color:#7d8b99;margin-bottom:2px}
+  .joint .h b{color:#d7e0e8;font-weight:500}
+  input[type=range]{width:100%;accent-color:#3f9bff}
+  .mono{font-family:Consolas,monospace}
+  .val{color:#7ee081}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<aside id="panel">
+  <h1>URDF 预览</h1>
+  <div class="row"><button class="primary" id="btnLoad" style="flex:1">重新加载</button></div>
+  <div class="row"><button id="btnZero" style="flex:1">全部归零</button></div>
+  <h2>关节</h2>
+  <div id="joints"></div>
+  <h2>末端位置 (mm)</h2>
+  <div class="row mono">X <span class="val" id="fkX">--</span>
+    Y <span class="val" id="fkY">--</span>
+    Z <span class="val" id="fkZ">--</span></div>
+  <div class="row"><span id="msg" style="color:#7d8b99"></span></div>
+</aside>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "/node_modules/three/build/three.module.js",
+    "three/addons/": "/node_modules/three/examples/jsm/",
+    "three/": "/node_modules/three/",
+    "urdf-loader": "/node_modules/urdf-loader/src/URDFLoader.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three'
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { STLLoader } from 'three/addons/loaders/STLLoader.js'
+import URDFLoader from 'urdf-loader'
+
+const URDF_URL = '/public/URDF/robot.urdf'
+
+const renderer = new THREE.WebGLRenderer({ antialias: true })
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
+renderer.setSize(innerWidth, innerHeight)
+document.getElementById('app').appendChild(renderer.domElement)
+
+const scene = new THREE.Scene()
+scene.background = new THREE.Color(0x11161c)
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.5, 20000)
+camera.up.set(0, 1, 0)
+
+const controls = new OrbitControls(camera, renderer.domElement)
+controls.enableDamping = true
+
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x20262c, 1.2))
+const sun = new THREE.DirectionalLight(0xffffff, 1.5)
+sun.position.set(300, 500, 300)
+scene.add(sun)
+
+let grid = new THREE.GridHelper(800, 40, 0x2b3a47, 0x1d2831)
+scene.add(grid)
+
+let robot = null
+let actuated = []
+let ee = null
+
+const loader = new URDFLoader()
+loader.parseVisual = true
+loader.parseCollision = false
+loader.loadMeshCb = (path, manager, done) => {
+  new STLLoader(manager).load(path, geo => {
+    geo.computeVertexNormals()
+    const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+      color: 0xb9c6d2, metalness: 0.25, roughness: 0.65
+    }))
+    done(mesh)
+  }, undefined, err => { console.warn('mesh fail', path, err); done(new THREE.Object3D()) })
+}
+
+function load() {
+  if (robot) { scene.remove(robot); robot = null }
+  actuated = []
+  document.getElementById('joints').innerHTML = ''
+  document.getElementById('msg').textContent = '加载中…'
+
+  fetch(URDF_URL + '?t=' + Date.now())
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text() })
+    .then(txt => {
+      const base = URDF_URL.slice(0, URDF_URL.lastIndexOf('/') + 1)
+      robot = loader.parse(txt, base)
+      scene.add(robot)
+
+      robot.traverse(o => { if (o.isMesh) { o.castShadow = true } })
+
+      const joints = Object.values(robot.joints || {})
+      actuated = joints
+        .filter(j => ['revolute', 'continuous'].includes(j.jointType))
+        .map(j => ({ joint: j, name: j.name }))
+
+      // 末端：最深的 link
+      let best = null, depth = -1
+      robot.traverse(o => {
+        if (o.isURDFLink) {
+          let d = 0, p = o
+          while (p && p !== robot) { d++; p = p.parent }
+          if (d > depth) { depth = d; best = o }
+        }
+      })
+      ee = best
+
+      buildSliders()
+      fit()
+      update()
+      document.getElementById('msg').textContent =
+        `${actuated.length} 个关节，末端 ${ee?.name || '?'}`
+    })
+    .catch(e => {
+      document.getElementById('msg').textContent = '加载失败：' + e.message
+      alert('加载失败：' + e.message)
+    })
+}
+
+function buildSliders() {
+  const box = document.getElementById('joints')
+  box.innerHTML = ''
+  actuated.forEach((a, i) => {
+    const lo = a.joint.limit?.lower ?? -Math.PI
+    const hi = a.joint.limit?.upper ?? Math.PI
+    let loD = lo * 180 / Math.PI, hiD = hi * 180 / Math.PI
+    if (!isFinite(loD) || !isFinite(hiD) || Math.abs(hiD - loD) < 1) { loD = -180; hiD = 180 }
+    const cur = (a.joint.jointValue?.[0] ?? 0) * 180 / Math.PI
+    const div = document.createElement('div')
+    div.className = 'joint'
+    div.innerHTML = `<div class="h"><b>${i + 1}. ${a.name}</b>
+      <span><span class="val" data-v>0.0</span>°</span></div>
+      <input type="range" min="${loD}" max="${hiD}" step="0.5" value="${cur}">`
+    const sl = div.querySelector('input')
+    const out = div.querySelector('[data-v]')
+    sl.addEventListener('input', () => {
+      a.joint.setJointValue(parseFloat(sl.value) * Math.PI / 180)
+      out.textContent = parseFloat(sl.value).toFixed(1)
+      update()
+    })
+    a.slider = sl; a.out = out
+    box.appendChild(div)
+  })
+}
+
+const p = new THREE.Vector3()
+function update() {
+  if (!robot || !ee) return
+  robot.updateMatrixWorld(true)
+  p.setFromMatrixPosition(ee.matrixWorld)
+  document.getElementById('fkX').textContent = p.x.toFixed(1)
+  document.getElementById('fkY').textContent = p.y.toFixed(1)
+  document.getElementById('fkZ').textContent = p.z.toFixed(1)
+}
+
+function fit() {
+  if (!robot) return
+  robot.updateMatrixWorld(true)
+  const box = new THREE.Box3().setFromObject(robot)
+  if (box.isEmpty()) return
+  const c = box.getCenter(new THREE.Vector3())
+  const s = box.getSize(new THREE.Vector3())
+  const r = Math.max(s.x, s.y, s.z) * 0.5 || 1
+  controls.target.copy(c)
+  const dist = r / Math.tan(camera.fov * Math.PI / 360) * 1.8
+  camera.position.set(c.x + dist * 0.7, c.y + dist * 0.6, c.z + dist * 0.7)
+  camera.near = Math.max(r / 500, 0.05)
+  camera.far = dist * 30
+  camera.updateProjectionMatrix()
+  grid.position.set(c.x, box.min.y, c.z)
+  controls.update()
+}
+
+document.getElementById('btnLoad').addEventListener('click', load)
+document.getElementById('btnZero').addEventListener('click', () => {
+  actuated.forEach(a => {
+    a.joint.setJointValue(0)
+    if (a.slider) { a.slider.value = 0; a.out.textContent = '0.0' }
+  })
+  update()
+})
+
+function animate() {
+  requestAnimationFrame(animate)
+  controls.update()
+  renderer.render(scene, camera)
+}
+animate()
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight
+  camera.updateProjectionMatrix()
+  renderer.setSize(innerWidth, innerHeight)
+})
+
+load()
+</script>
+</body>
+</html>
